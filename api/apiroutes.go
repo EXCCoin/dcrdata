@@ -6,6 +6,7 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/EXCCoin/exccd/chaincfg"
@@ -94,6 +96,8 @@ type DataSourceAux interface {
 	VotesInBlock(hash string) (int16, error)
 	GetTxHistoryData(address string, addrChart dbtypes.HistoryChart,
 		chartGroupings dbtypes.ChartGrouping) (*dbtypes.ChartsData, error)
+	TicketPoolVisualization(interval dbtypes.ChartGrouping) (
+		[]*dbtypes.PoolTicketsData, *dbtypes.PoolTicketsData, uint64, error)
 }
 
 // exccdata application context used by all route handlers
@@ -412,6 +416,50 @@ func (c *appContext) getVoteInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, voteVersionInfo, c.getIndentQuery(r))
 }
 
+// setOutputSpends retrieves spending transaction information for each output of
+// the specified transaction. This sets the vouts[i].Spend fields for each
+// output that is spent. For unspent outputs, the Spend field remains a nil
+// pointer.
+func (c *appContext) setOutputSpends(txid string, vouts []apitypes.Vout) error {
+	if c.LiteMode {
+		apiLog.Warnf("Not setting spending transaction data in lite mode.")
+		return nil
+	}
+
+	// For each output of this transaction, look up any spending transactions,
+	// and the index of the spending transaction input.
+	spendHashes, spendVinInds, voutInds, err := c.AuxDataSource.SpendingTransactions(txid)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("unable to get spending transaction info for outputs of %s", txid)
+	}
+	if len(voutInds) > len(vouts) {
+		return fmt.Errorf("invalid spending transaction data for %s", txid)
+	}
+	for i, vout := range voutInds {
+		if int(vout) >= len(vouts) {
+			return fmt.Errorf("invalid spending transaction data (%s:%d)", txid, vout)
+		}
+		vouts[vout].Spend = &apitypes.TxInputID{
+			Hash:  spendHashes[i],
+			Index: spendVinInds[i],
+		}
+	}
+	return nil
+}
+
+// setTxSpends retrieves spending transaction information for each output of the
+// given transaction. This sets the tx.Vout[i].Spend fields for each output that
+// is spent. For unspent outputs, the Spend field remains a nil pointer.
+func (c *appContext) setTxSpends(tx *apitypes.Tx) error {
+	return c.setOutputSpends(tx.TxID, tx.Vout)
+}
+
+// setTrimmedTxSpends is like setTxSpends except that it operates on a TrimmedTx
+// instead of a Tx.
+func (c *appContext) setTrimmedTxSpends(tx *apitypes.TrimmedTx) error {
+	return c.setOutputSpends(tx.TxID, tx.Vout)
+}
+
 func (c *appContext) getTransaction(w http.ResponseWriter, r *http.Request) {
 	txid := m.GetTxIDCtx(r)
 	if txid == "" {
@@ -424,6 +472,21 @@ func (c *appContext) getTransaction(w http.ResponseWriter, r *http.Request) {
 		apiLog.Errorf("Unable to get transaction %s", txid)
 		http.Error(w, http.StatusText(422), 422)
 		return
+	}
+
+	// Look up any spending transactions for each output of this transaction.
+	// This is only done in full mode, and when the client requests spends with
+	// the URL query ?spends=true.
+	spendParam := r.URL.Query().Get("spends")
+	withSpends := spendParam == "1" || strings.EqualFold(spendParam, "true")
+
+	if withSpends && !c.LiteMode {
+		if err := c.setTxSpends(tx); err != nil {
+			apiLog.Errorf("Unable to get spending transaction info for outputs of %s: %v", txid, err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError),
+				http.StatusInternalServerError)
+			return
+		}
 	}
 
 	writeJSON(w, tx, c.getIndentQuery(r))
@@ -455,6 +518,21 @@ func (c *appContext) getDecodedTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Look up any spending transactions for each output of this transaction.
+	// This is only done in full mode, and when the client requests spends with
+	// the URL query ?spends=true.
+	spendParam := r.URL.Query().Get("spends")
+	withSpends := spendParam == "1" || strings.EqualFold(spendParam, "true")
+
+	if withSpends && !c.LiteMode {
+		if err := c.setTrimmedTxSpends(tx); err != nil {
+			apiLog.Errorf("Unable to get spending transaction info for outputs of %s: %v", txid, err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError),
+				http.StatusInternalServerError)
+			return
+		}
+	}
+
 	writeJSON(w, tx, c.getIndentQuery(r))
 }
 
@@ -465,6 +543,12 @@ func (c *appContext) getTransactions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Look up any spending transactions for each output of this transaction.
+	// This is only done in full mode, and when the client requests spends with
+	// the URL query ?spends=true.
+	spendParam := r.URL.Query().Get("spends")
+	withSpends := spendParam == "1" || strings.EqualFold(spendParam, "true")
+
 	txns := make([]*apitypes.Tx, 0, len(txids))
 	for i := range txids {
 		tx := c.BlockData.GetRawTransaction(txids[i])
@@ -473,6 +557,17 @@ func (c *appContext) getTransactions(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(422), 422)
 			return
 		}
+
+		if withSpends && !c.LiteMode {
+			if err := c.setTxSpends(tx); err != nil {
+				apiLog.Errorf("Unable to get spending transaction info for outputs of %s: %v",
+					txids[i], err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError),
+					http.StatusInternalServerError)
+				return
+			}
+		}
+
 		txns = append(txns, tx)
 	}
 
@@ -723,6 +818,41 @@ func (c *appContext) getSSTxDetails(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, sstxDetails, c.getIndentQuery(r))
 }
 
+func (c *appContext) getTicketPoolByDate(w http.ResponseWriter, r *http.Request) {
+	if c.LiteMode {
+		// not available in lite mode
+		http.Error(w, "not available in lite mode", 422)
+		return
+	}
+
+	tp := m.GetTpCtx(r)
+	// default to day if no grouping was sent
+	if tp == "" {
+		tp = "day"
+	}
+
+	// The db queries are fast enough that it makes sense to call
+	// TicketPoolVisualization here even though it returns a lot of data not
+	// needed by this request.
+	interval := dbtypes.ChartGroupingFromStr(tp)
+	barCharts, _, height, err := c.AuxDataSource.TicketPoolVisualization(interval)
+	if err != nil {
+		apiLog.Errorf("Unable to get ticket pool by date: %v", err)
+		http.Error(w, http.StatusText(422), 422)
+		return
+	}
+
+	tpResponse := struct {
+		Height     uint64                   `json:"height"`
+		PoolByDate *dbtypes.PoolTicketsData `json:"ticket_pool_data"`
+	}{
+		height,
+		barCharts[0], // purchase time distribution
+	}
+
+	writeJSON(w, tpResponse, c.getIndentQuery(r))
+}
+
 func (c *appContext) getBlockSize(w http.ResponseWriter, r *http.Request) {
 	idx := c.getBlockHeightCtx(r)
 	if idx < 0 {
@@ -764,7 +894,7 @@ func (c *appContext) blockSubsidies(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	work, stake := txhelpers.RewardsAtBlock(idx, uint16(numVotes), c.Params)
+	work, stake, tax := txhelpers.RewardsAtBlock(idx, uint16(numVotes), c.Params)
 	rewards := apitypes.BlockSubsidies{
 		BlockNum:   idx,
 		BlockHash:  hash,
@@ -772,7 +902,8 @@ func (c *appContext) blockSubsidies(w http.ResponseWriter, r *http.Request) {
 		Stake:      stake,
 		NumVotes:   numVotes,
 		TotalStake: stake * int64(numVotes),
-		Total:      work + stake*int64(numVotes),
+		Tax:        tax,
+		Total:      work + stake*int64(numVotes) + tax,
 	}
 
 	writeJSON(w, rewards, c.getIndentQuery(r))
@@ -1172,7 +1303,7 @@ func (c *appContext) getTicketPriceChartData(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	chartData, ok := explorer.GetChartTypeData("ticket-price")
+	chartData, ok := explorer.ChartTypeData("ticket-price")
 	if !ok {
 		http.NotFound(w, r)
 		log.Warnf(`No data matching "ticket-price" chart Type was found`)
@@ -1181,14 +1312,14 @@ func (c *appContext) getTicketPriceChartData(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, chartData, c.getIndentQuery(r))
 }
 
-func (c *appContext) getChartTypeData(w http.ResponseWriter, r *http.Request) {
+func (c *appContext) ChartTypeData(w http.ResponseWriter, r *http.Request) {
 	if c.LiteMode {
 		http.Error(w, "not available in lite mode", 422)
 		return
 	}
 
 	chartType := m.GetChartTypeCtx(r)
-	chartData, ok := explorer.GetChartTypeData(chartType)
+	chartData, ok := explorer.ChartTypeData(chartType)
 	if !ok {
 		http.NotFound(w, r)
 		log.Warnf(`No data matching "%s" chart Type was found`, chartType)

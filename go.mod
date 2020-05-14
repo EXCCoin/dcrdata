@@ -1,5 +1,7 @@
 module github.com/EXCCoin/exccdata
 
+go 1.14
+
 require (
 	github.com/AndreasBriese/bbloom v0.0.0-20180913140656-343706a395b7 // indirect
 	github.com/DataDog/zstd v1.3.4 // indirect
